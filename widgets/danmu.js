@@ -20,7 +20,7 @@
 WidgetMetadata = {
   id: "custom.logvar.danmu",
   title: "LogVar弹幕",
-  version: "1.1.8",
+  version: "1.1.9",
   requiredVersion: "0.0.2",
   description: "兼容 LogVar 电影分类并优先精确标题匹配；支持多服务器地址。",
   author: "Herlyleen",
@@ -404,9 +404,14 @@ async function fetchMatchedAnimeForSearch(source, params, shouldBindSource) {
 }
 
 async function searchDanmu(params) {
-  const { tmdbId, type, title, season, link, videoUrl, server } = params;
+  const { tmdbId, type, title, season, link, videoUrl, server, premiereDate, airDate } = params;
 
-  let queryTitle = title;
+  // 电影搜索附加年份可绕开宽泛标题缓存，并提高源站搜索准确率。
+  // 排序仍使用 params.title 的纯片名，因此“美人鱼(2016)”会获得精确匹配最高分。
+  const releaseYear = String(premiereDate || airDate || "").match(/\b(19|20)\d{2}\b/)?.[0];
+  let queryTitle = type === "movie" && releaseYear
+    ? `${title} ${releaseYear}`
+    : title;
   const sources = getDanmuSources(server);
   const shouldBindSource = shouldShowDanmuSource(sources);
   const matchedResults = await mapDanmuSourcesInBatches(sources, DANMU_SOURCE_BATCH_SIZE, async (source) => {
