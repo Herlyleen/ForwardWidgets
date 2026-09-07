@@ -5,12 +5,12 @@
   "widgets": [
     {
       "id": "custom.logvar.danmu",
-      "title": "LogVar弹幕",
+      "title": "LogVar弹幕 1.1.10",
       "description": "兼容华语电影、外语电影、动画电影等 LogVar 类型",
       "requiredVersion": "0.0.2",
-      "version": "1.1.9",
+      "version": "1.1.10",
       "author": "Herlyleen",
-      "url": "https://raw.githubusercontent.com/Herlyleen/ForwardWidgets/master/widgets/danmu.js?v=1.1.9"
+      "url": "https://raw.githubusercontent.com/Herlyleen/ForwardWidgets/8ce0f44c64d4cf26729979af409797bdb1377f83/widgets/danmu.js"
     }
   ]
 }
