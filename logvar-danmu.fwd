@@ -1,6 +1,6 @@
 {
   "title": "LogVar 弹幕",
-  "description": "兼容 LogVar 电影分类、精确标题匹配和多服务器配置",
+  "description": "兼容 LogVar 电影分类、年份搜索、精确标题匹配和多服务器配置",
   "icon": "https://raw.githubusercontent.com/Herlyleen/ForwardWidgets/master/icon.png",
   "widgets": [
     {
@@ -8,7 +8,7 @@
       "title": "LogVar弹幕",
       "description": "兼容华语电影、外语电影、动画电影等 LogVar 类型",
       "requiredVersion": "0.0.2",
-      "version": "1.1.8",
+      "version": "1.1.9",
       "author": "Herlyleen",
       "url": "https://raw.githubusercontent.com/Herlyleen/ForwardWidgets/master/widgets/danmu.js"
     }
