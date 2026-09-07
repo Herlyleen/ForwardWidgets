@@ -19,8 +19,8 @@
  */
 WidgetMetadata = {
   id: "custom.logvar.danmu",
-  title: "LogVar弹幕",
-  version: "1.1.9",
+  title: "LogVar弹幕 1.1.10",
+  version: "1.1.10",
   requiredVersion: "0.0.2",
   description: "兼容 LogVar 电影分类并优先精确标题匹配；支持多服务器地址。",
   author: "Herlyleen",
@@ -203,7 +203,7 @@ function appendDanmuSourceTitle(title, source, shouldAppend) {
 function normalizeDanmuSearchTitle(value) {
   return cleanAnimeTitle(value)
     .replace(/【[^】]*】/g, "")
-    .replace(/\s+from\s+.*$/i, "")
+    .replace(/\s*from\s+.*$/i, "")
     .replace(/\s+/g, "")
     .toLowerCase();
 }
@@ -404,6 +404,7 @@ async function fetchMatchedAnimeForSearch(source, params, shouldBindSource) {
 }
 
 async function searchDanmu(params) {
+  console.log('[LogVar 1.1.10] search', JSON.stringify({title: params.title, seriesName: params.seriesName, type: params.type}));
   const { tmdbId, type, title, season, link, videoUrl, server, premiereDate, airDate } = params;
 
   // 电影搜索附加年份可绕开宽泛标题缓存，并提高源站搜索准确率。
@@ -486,7 +487,7 @@ async function searchDanmu(params) {
         ...anime,
         // Misaka 等兼容服务的 bangumi/{id} 端点只认 bangumiId(如 "A900016")，而非数字 animeId(900016)；
         // 标准 dandanplay 无 bangumiId 字段，回退到 animeId 保持原行为
-        animeId: bindDanmuServerId(anime.bangumiId || anime.animeId, result.source, shouldBindSource),
+        animeId: bindDanmuServerId(anime.source && anime.animeId != null ? anime.animeId : (anime.bangumiId || anime.animeId), result.source, shouldBindSource),
         animeTitle: appendDanmuSourceTitle(anime.animeTitle, result.source, shouldBindSource),
       };
       return {
@@ -497,8 +498,10 @@ async function searchDanmu(params) {
   }
 
   if (hasSuccessfulResponse || candidates.length > 0) {
+    const ranked = rankedDanmuCandidates(candidates);
+    console.log('[LogVar 1.1.10] returned', JSON.stringify(ranked.map(a => ({title: a.animeTitle, id: parseDanmuServerId(a.animeId).id}))));
     return {
-      animes: rankedDanmuCandidates(candidates),
+      animes: ranked,
     };
   }
 
