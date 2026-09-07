@@ -20,9 +20,9 @@
 WidgetMetadata = {
   id: "custom.logvar.danmu",
   title: "LogVar弹幕",
-  version: "1.0.3",
+  version: "1.1.8",
   requiredVersion: "0.0.2",
-  description: "兼容 LogVar 电影分类并优先精确标题匹配",
+  description: "兼容 LogVar 电影分类并优先精确标题匹配；支持多服务器地址。",
   author: "Herlyleen",
   site: "https://github.com/Herlyleen/ForwardWidgets",
   globalParams: [
@@ -66,123 +66,438 @@ WidgetMetadata = {
   ],
 };
 
+const DEFAULT_DANMU_SERVER = "https://api.dandanplay.net";
+const DANMU_SERVER_ID_SEPARATOR = "__FORWARD_DANMU_SERVER__";
+const DANMU_SOURCE_BATCH_SIZE = 5;
+const DANMU_SEARCH_RESULT_LIMIT = 5;
+
+function normalizeDanmuServer(server) {
+  return String(server || "").trim().replace(/\/+$/, "");
+}
+
+function getDanmuSourceTitle(server) {
+  try {
+    return new URL(server).host || server;
+  } catch (error) {
+    return server;
+  }
+}
+
+function looksLikeServerAddress(value) {
+  return /^(https?:\/\/|localhost\b|127\.0\.0\.1\b)/i.test(value);
+}
+
+function makeDanmuSource(title, server, explicitTitle) {
+  const normalizedServer = normalizeDanmuServer(server);
+  const normalizedTitle = String(title || "").trim();
+  return {
+    title: normalizedTitle || getDanmuSourceTitle(normalizedServer),
+    server: normalizedServer,
+    explicitTitle: Boolean(explicitTitle && normalizedTitle),
+  };
+}
+
+function parseDanmuSourceLine(line) {
+  const separatorMatch = line.match(/[，,]/);
+  if (!separatorMatch) {
+    return makeDanmuSource("", line, false);
+  }
+
+  const separatorIndex = separatorMatch.index;
+  const title = line.slice(0, separatorIndex).trim();
+  const server = line.slice(separatorIndex + separatorMatch[0].length).trim();
+
+  if (!server && looksLikeServerAddress(title)) {
+    return makeDanmuSource("", title, false);
+  }
+
+  return makeDanmuSource(title, server, true);
+}
+
+function getDanmuSources(server) {
+  const serverValue = Array.isArray(server) ? server.join("\n") : server;
+  const rawValue = String(serverValue || "").trim();
+
+  if (!rawValue) {
+    return [makeDanmuSource("弹弹play", DEFAULT_DANMU_SERVER, true)];
+  }
+
+  const lines = rawValue.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 1) {
+    const commaParts = lines[0].split(/[，,]/).map((item) => item.trim()).filter(Boolean);
+    if (commaParts.length > 1 && commaParts.every(looksLikeServerAddress)) {
+      return dedupeDanmuSources(commaParts.map((item) => makeDanmuSource("", item, false)));
+    }
+  }
+
+  return dedupeDanmuSources(lines.map(parseDanmuSourceLine).filter((source) => source.server));
+}
+
+function dedupeDanmuSources(sources) {
+  const sourceMap = new Map();
+  for (const source of sources) {
+    if (!sourceMap.has(source.server)) {
+      sourceMap.set(source.server, source);
+    }
+  }
+  return Array.from(sourceMap.values());
+}
+
+function bindDanmuServerId(id, source, shouldBind) {
+  if (!shouldBind || id === undefined || id === null) {
+    return id;
+  }
+  const payload = JSON.stringify({
+    title: source.title,
+    server: source.server,
+  });
+  return `${encodeURIComponent(payload)}${DANMU_SERVER_ID_SEPARATOR}${id}`;
+}
+
+function parseDanmuServerId(id) {
+  if (typeof id !== "string") {
+    return { id, source: null };
+  }
+
+  const separatorIndex = id.indexOf(DANMU_SERVER_ID_SEPARATOR);
+  if (separatorIndex === -1) {
+    return { id, source: null };
+  }
+
+  const encodedSource = id.slice(0, separatorIndex);
+  const rawId = id.slice(separatorIndex + DANMU_SERVER_ID_SEPARATOR.length);
+  const decodedSource = decodeURIComponent(encodedSource);
+  try {
+    const source = JSON.parse(decodedSource);
+    if (source && source.server) {
+      return {
+        id: rawId,
+        source: makeDanmuSource(source.title, source.server, true),
+      };
+    }
+  } catch (error) {
+    // 兼容旧版只绑定 server 地址的 ID。
+  }
+
+  return {
+    id: rawId,
+    source: makeDanmuSource("", decodedSource, false),
+  };
+}
+
+function getDanmuRequestSources(server, boundSource) {
+  return boundSource ? [boundSource] : getDanmuSources(server);
+}
+
+function shouldShowDanmuSource(sources) {
+  return sources.some((source) => source.explicitTitle);
+}
+
+function appendDanmuSourceTitle(title, source, shouldAppend) {
+  if (!shouldAppend) {
+    return title;
+  }
+  return `${title} - ${source.title}`;
+}
+
+function normalizeDanmuSearchTitle(value) {
+  return cleanAnimeTitle(value)
+    .replace(/【[^】]*】/g, "")
+    .replace(/\s+from\s+.*$/i, "")
+    .replace(/\s+/g, "")
+    .toLowerCase();
+}
+
+function scoreDanmuSearchAnime(anime, params, index) {
+  const animeTitle = normalizeDanmuSearchTitle(anime && anime.animeTitle);
+  const queryTitle = normalizeDanmuSearchTitle(params.seriesName || params.title);
+  let score = 500 - index;
+
+  // 精确同名优先，避免“美人鱼村”等模糊结果排在“美人鱼”前面。
+  if (queryTitle && animeTitle === queryTitle) {
+    score += 2000;
+  } else if (queryTitle && animeTitle.startsWith(queryTitle)) {
+    score += 500;
+  } else if (queryTitle && animeTitle.includes(queryTitle)) {
+    score += 120;
+  }
+
+  const seasonNum = Number(params.season);
+  if (!Number.isNaN(seasonNum) && seasonNum > 0) {
+    const animeSeason = extractSeasonNumber(animeTitle);
+    if (animeSeason === seasonNum) {
+      score += 160;
+    } else if (animeSeason !== null) {
+      score -= 160;
+    }
+  }
+  return score;
+}
+
+function rankedDanmuCandidates(candidates) {
+  const seen = new Set();
+  return candidates
+    .sort((left, right) => right.score - left.score)
+    .filter(({ anime }) => {
+      const id = anime.animeId === undefined || anime.animeId === null ? anime.animeTitle : String(anime.animeId);
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    })
+    .slice(0, DANMU_SEARCH_RESULT_LIMIT)
+    .map(({ anime }) => anime);
+}
+
+function getDanmuHeaders() {
+  return {
+    // "X-AppId": "",
+    // "X-AppSecret": "",
+    "Content-Type": "application/json",
+    "User-Agent": "ForwardWidgets/1.0.0",
+  };
+}
+
+async function mapDanmuSourcesInBatches(sources, batchSize, task) {
+  const results = [];
+  for (let index = 0; index < sources.length; index += batchSize) {
+    const batch = sources.slice(index, index + batchSize);
+    const batchResults = await Promise.all(batch.map(task));
+    results.push(...batchResults);
+  }
+  return results;
+}
+
+// 从番剧标题提取季号，兼容多种命名：
+//   "剑来 第二季"→2、"【tencent】剑来_02"→2、"剑来2"→2、"剑来 S2"→2
+// 优先匹配"第X季/部"，并把季号限制在 1-2 位，避免把年份(2025)误判为季号
+function extractSeasonNumber(animeTitle) {
+  const title = String(animeTitle || "");
+  let m = title.match(/第\s*([0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+)\s*[季部]/);
+  if (m) {
+    const n = convertChineseNumber(m[1]);
+    if (n > 0) return n;
+  }
+  m = title.match(/(?:_|\bS|\bSeason\s+)(\d{1,2})\b/i);
+  if (m) return Number(m[1]);
+  m = title.match(/[^\d](\d{1,2})$/);
+  if (m) return Number(m[1]);
+  return null;
+}
+
+function isMovieAnime(anime) {
+  let animeType = String((anime && anime.type) || "").trim().toLowerCase();
+
+  // LogVar 等兼容接口可能返回“华语电影/外语电影/动画电影”，
+  // 或只在 animeTitle 的【分类】中提供媒体类型。
+  if (!animeType) {
+    const typeMatch = String((anime && anime.animeTitle) || "").match(/【([^】]+)】/);
+    animeType = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
+  }
+
+  return (
+    animeType === "movie" ||
+    animeType.includes("电影") ||
+    animeType === "奇幻片" ||
+    animeType === "剧场版"
+  );
+}
+
+function filterAnimes(rawAnimes, type, season, queryTitle) {
+  if (!Array.isArray(rawAnimes)) {
+    return [];
+  }
+
+  return rawAnimes.filter((anime) => {
+    const isMovie = isMovieAnime(anime);
+    if (type === "movie") {
+      return isMovie;
+    }
+    // tv 类型兜底：只排除电影类型，其余都算剧集。
+    if (type === "tv") {
+      return !isMovie;
+    }
+    return true;
+  });
+}
+
+function buildMatchedAnime(source, matched, episode, fallbackTitle, fileName, shouldBindSource) {
+  if (!matched || matched.episodeId === undefined || matched.episodeId === null) return null;
+  const rawEpisodeId = String(matched.episodeId);
+  const rawAnimeId = matched.animeId === undefined || matched.animeId === null
+    ? `unknown-${rawEpisodeId}`
+    : String(matched.animeId);
+  const animeTitle = String(matched.animeTitle || fallbackTitle || fileName || "").trim();
+  const episodeTitle = String(matched.episodeTitle || fallbackTitle || fileName || "").trim();
+  const displayTitle = [animeTitle, episodeTitle]
+    .filter(Boolean)
+    .filter((item, index, items) => index === 0 || item !== items[0])
+    .join(" - ");
+  const safeDisplayTitle = displayTitle || String(fallbackTitle || fileName || "").trim() || "弹幕匹配结果";
+  const providerId = `match-${rawAnimeId}-${rawEpisodeId}`;
+  const episodeNumber = episode ? String(episode) : undefined;
+  return {
+    animeId: bindDanmuServerId(providerId, source, shouldBindSource),
+    animeTitle: safeDisplayTitle,
+    type: "match",
+    episodes: [{
+      episodeId: bindDanmuServerId(rawEpisodeId, source, shouldBindSource),
+      episodeTitle: episodeTitle || `第${episodeNumber || 1}集`,
+      episodeNumber,
+    }],
+  };
+}
+
+function buildCanonicalMatchFileName(params) {
+  const title = cleanAnimeTitle(params.seriesName || params.title)
+    .replace(/\s*第\s*[一二三四五六七八九十百零〇\d]+\s*[季部]\s*$/g, "")
+    .trim();
+  const episode = Number(params.episode);
+  if (!title || Number.isNaN(episode) || episode <= 0) return null;
+
+  const season = Number(params.season);
+  const seasonNumber = !Number.isNaN(season) && season > 0 ? season : 1;
+  return `${title} S${String(seasonNumber).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
+}
+
+function buildSearchMatchInputs(params) {
+  const canonicalFileName = buildCanonicalMatchFileName(params);
+  if (!canonicalFileName) {
+    return [];
+  }
+  return [{
+    fileName: canonicalFileName,
+    fileHash: null,
+    scoreBase: 10000,
+  }];
+}
+
+async function fetchMatchedAnimeForSearch(source, params, shouldBindSource) {
+  const inputs = buildSearchMatchInputs(params);
+  const candidates = [];
+  for (const input of inputs) {
+    try {
+      const response = await Widget.http.request({
+        url: `${source.server}/api/v2/match`,
+        method: "POST",
+        data: {
+          videoDuration: 0,
+          fileHash: input.fileHash,
+          fileName: input.fileName,
+          matchMode: "fileNameOnly",
+          fileSize: 0,
+        },
+        headers: getDanmuHeaders(),
+      });
+      const data = response && response.data;
+      if (!data || !data.isMatched || !Array.isArray(data.matches) || data.matches.length === 0) continue;
+      candidates.push(...data.matches
+        .map((matched, index) => ({
+          anime: buildMatchedAnime(source, matched, params.episode, params.title, input.fileName, shouldBindSource),
+          score: input.scoreBase - index,
+        }))
+        .filter(({ anime }) => Boolean(anime)));
+    } catch (error) {
+      console.error(`match ${source.server} 失败:`, error);
+    }
+  }
+  return candidates;
+}
+
 async function searchDanmu(params) {
   const { tmdbId, type, title, season, link, videoUrl, server } = params;
 
   let queryTitle = title;
-
-  // 调用弹弹play搜索API - 使用Widget.http.get
-  const response = await Widget.http.get(
-    `${server}/api/v2/search/anime?keyword=${encodeURIComponent(queryTitle)}`,
-    {
-      headers: {
-        // "X-AppId": "",
-        // "X-AppSecret": "",
-        "Content-Type": "application/json",
-        "User-Agent": "ForwardWidgets/1.0.0",
-      },
-    }
-  );
-
-  if (!response) {
-    throw new Error("获取数据失败");
-  }
-
-  const data = response.data;
-
-  // 检查API返回状态
-  if (!data.success) {
-    throw new Error(data.errorMessage || "API调用失败");
-  }
-
-  // 开始过滤数据
-  const isMovieAnime = (anime) => {
-    let animeType = String(anime.type || "").trim().toLowerCase();
-
-    // LogVar 等兼容接口可能使用“华语电影/外语电影/动画电影”，
-    // 或只在标题的【分类】中提供类型。
-    if (!animeType) {
-      animeType = String(anime.animeTitle || "")
-        .match(/【([^】]+)】/)?.[1]
-        ?.trim()
-        ?.toLowerCase() || "";
-    }
-
-    return (
-      animeType === "movie" ||
-      animeType.includes("电影") ||
-      animeType === "奇幻片" ||
-      animeType === "剧场版"
-    );
-  };
-
-  let animes = [];
-  if (data.animes && data.animes.length > 0) {
-    animes = data.animes.filter((anime) => {
-      const isMovie = isMovieAnime(anime);
-      if (type === "movie") {
-        return isMovie;
-      }
-      // tv 类型兜底：只排除电影类型，其余都算剧集
-      if (type === "tv") {
-        return !isMovie;
-      }
-      return true;
-    });
-    if (season) {
-      // filter season
-      const matchedAnimes = animes.filter((anime) => {
-        if (anime.animeTitle.includes(queryTitle)) {
-          // use space to split animeTitle
-          let titleParts = anime.animeTitle.split(" ");
-          if (titleParts.length > 1) {
-            let seasonPart = titleParts[1];
-            // match number from seasonPart
-            let seasonIndex = seasonPart.match(/\d+/);
-            if (seasonIndex && seasonIndex[0] === season) {
-              return true;
-            }
-            // match chinese number
-            let chineseNumber = seasonPart.match(/[一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+/);
-            if (chineseNumber && String(convertChineseNumber(chineseNumber[0])) === season) {
-              return true;
-            }
-          }
-          return false;
-        } else {
-          return false;
+  const sources = getDanmuSources(server);
+  const shouldBindSource = shouldShowDanmuSource(sources);
+  const matchedResults = await mapDanmuSourcesInBatches(sources, DANMU_SOURCE_BATCH_SIZE, async (source) => {
+    const candidates = await fetchMatchedAnimeForSearch(source, params, shouldBindSource);
+    return { source, candidates };
+  });
+  const results = await mapDanmuSourcesInBatches(sources, DANMU_SOURCE_BATCH_SIZE, async (source) => {
+    try {
+      // 调用弹弹play搜索API - 使用Widget.http.get
+      const response = await Widget.http.get(
+        `${source.server}/api/v2/search/anime?keyword=${encodeURIComponent(queryTitle)}`,
+        {
+          headers: getDanmuHeaders(),
         }
-      }); 
-      if (matchedAnimes.length > 0) {
-        animes = matchedAnimes;
+      );
+
+      if (!response) {
+        throw new Error("获取数据失败");
       }
+
+      const data = response.data;
+
+      // 检查API返回状态
+      if (!data.success) {
+        throw new Error(data.errorMessage || "API调用失败");
+      }
+
+      let rawAnimes = Array.isArray(data.animes) ? data.animes : [];
+      // 兜底：search/anime 为空时用 search/episodes（库内查询，兼容未开后备/并行搜索的实例）
+      if (rawAnimes.length === 0) {
+        const epResponse = await Widget.http.get(
+          `${source.server}/api/v2/search/episodes?anime=${encodeURIComponent(queryTitle)}`,
+          { headers: getDanmuHeaders() }
+        );
+        const epData = epResponse && epResponse.data;
+        if (epData && Array.isArray(epData.animes)) {
+          // 剥离内联 episodes，只保留番剧候选层（App 按三段流程后续调 getDetail 取分集）
+          rawAnimes = epData.animes.map(({ episodes, ...anime }) => anime);
+        }
+      }
+
+      return {
+        source,
+        animes: filterAnimes(rawAnimes, type, season, queryTitle),
+      };
+    } catch (error) {
+      console.error(`请求 ${source.server} 失败:`, error);
+      return {
+        source,
+        error,
+      };
     }
+  });
+
+  let lastError = null;
+  let hasSuccessfulResponse = false;
+  const candidates = [];
+
+  for (const result of matchedResults) {
+    candidates.push(...result.candidates);
   }
-  // 精确同名优先，避免“美人鱼村”等模糊结果排在“美人鱼”前面。
-  const normalizeSearchTitle = (value) =>
-    String(value || "")
-      .replace(/【[^】]*】/g, "")
-      .replace(/[（(]\d{4}[）)]/g, "")
-      .replace(/\s+from\s+.*$/i, "")
-      .replace(/\s+/g, "")
-      .toLowerCase();
 
-  const normalizedQuery = normalizeSearchTitle(queryTitle);
-  animes = animes
-    .map((anime, index) => {
-      const normalizedTitle = normalizeSearchTitle(anime.animeTitle);
-      let score = 0;
-      if (normalizedTitle === normalizedQuery) score = 3000;
-      else if (normalizedTitle.startsWith(normalizedQuery)) score = 1000;
-      else if (normalizedTitle.includes(normalizedQuery)) score = 100;
-      return { anime, score, index };
-    })
-    .sort((a, b) => b.score - a.score || a.index - b.index)
-    .map(({ anime }) => anime);
+  for (const result of results) {
+    if (result.error) {
+      lastError = result.error;
+      continue;
+    }
 
-  return {
-    animes: animes,
-  };
+    hasSuccessfulResponse = true;
+    candidates.push(...result.animes.map((anime, index) => {
+      const searchAnime = {
+        ...anime,
+        // Misaka 等兼容服务的 bangumi/{id} 端点只认 bangumiId(如 "A900016")，而非数字 animeId(900016)；
+        // 标准 dandanplay 无 bangumiId 字段，回退到 animeId 保持原行为
+        animeId: bindDanmuServerId(anime.bangumiId || anime.animeId, result.source, shouldBindSource),
+        animeTitle: appendDanmuSourceTitle(anime.animeTitle, result.source, shouldBindSource),
+      };
+      return {
+        anime: searchAnime,
+        score: scoreDanmuSearchAnime(anime, params, index),
+      };
+    }));
+  }
+
+  if (hasSuccessfulResponse || candidates.length > 0) {
+    return {
+      animes: rankedDanmuCandidates(candidates),
+    };
+  }
+
+  throw lastError || new Error("获取数据失败");
 }
 
 function convertChineseNumber(chineseNumber) {
@@ -246,48 +561,216 @@ function convertChineseNumber(chineseNumber) {
   return result;
 }
 
-async function getDetailById(params) {
-  const { server, animeId } = params;
-  const response = await Widget.http.get(
-    `${server}/api/v2/bangumi/${animeId}`,
-    {
-      headers: {
-        // "X-AppId": "",
-        // "X-AppSecret": "",
-        "Content-Type": "application/json",
-        "User-Agent": "ForwardWidgets/1.0.0",
-      },
-    }
-  );
+// 去掉 Misaka 兼容服务在 animeTitle 上加的后缀，还原干净搜索词
+//   "剑来 第二季 （来源：tencent 年份：2025）" -> "剑来 第二季"
+//   "剑来（库内：2）（搜索：1-10）" -> "剑来"
+function cleanAnimeTitle(title) {
+  return String(title || "").replace(/（[^）]*）/g, "").replace(/\([^)]*\)/g, "").replace(/\s+/g, " ").trim();
+}
 
-  if (!response) {
-    throw new Error("获取数据失败");
+// 标准 dandanplay / 真实作品ID：bangumi/{id} 直接拿分集（稳定，不过期）
+async function fetchEpisodesByBangumi(source, id) {
+  try {
+    const response = await Widget.http.get(
+      `${source.server}/api/v2/bangumi/${id}`,
+      { headers: getDanmuHeaders() }
+    );
+    const episodes = response && response.data && response.data.bangumi && response.data.bangumi.episodes;
+    return Array.isArray(episodes) && episodes.length > 0 ? episodes : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+// 库内兜底：search/episodes 直接内联返回稳定 episodes（仅库内，兼容未开后备的实例如 wuqingfeng）
+async function fetchEpisodesByLibrary(source, title, season) {
+  const query = cleanAnimeTitle(title);
+  if (!query) return null;
+  try {
+    const response = await Widget.http.get(
+      `${source.server}/api/v2/search/episodes?anime=${encodeURIComponent(query)}`,
+      { headers: getDanmuHeaders() }
+    );
+    const animes = response && response.data && response.data.animes;
+    if (!Array.isArray(animes) || animes.length === 0) return null;
+
+    let target = animes[0];
+    const s = Number(season);
+    if (animes.length > 1 && !Number.isNaN(s) && s > 0) {
+      const matched = animes.find((a) => extractSeasonNumber(a.animeTitle) === s);
+      if (matched) target = matched;
+    }
+    return Array.isArray(target.episodes) && target.episodes.length > 0 ? target.episodes : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+// 兜底：bangumi 临时ID跨数据快照会过期。重新 search/anime 拿"新鲜"ID（同请求内不过期，
+// 且能并行命中库外新剧，search/episodes 只查库内），再立即 bangumi 取分集
+async function fetchEpisodesByResearch(source, title, season) {
+  const query = cleanAnimeTitle(title);
+  if (!query) return null;
+  try {
+    const searchRes = await Widget.http.get(
+      `${source.server}/api/v2/search/anime?keyword=${encodeURIComponent(query)}`,
+      { headers: getDanmuHeaders() }
+    );
+    const animes = searchRes && searchRes.data && searchRes.data.animes;
+    if (!Array.isArray(animes) || animes.length === 0) return null;
+
+    // 选回对应番剧：原始标题精确匹配优先，否则按 清洗标题+season 收窄
+    let target = animes.find((a) => a.animeTitle === title);
+    if (!target) {
+      const cands = animes.filter((a) => {
+        const c = cleanAnimeTitle(a.animeTitle);
+        return c === query || c.startsWith(query) || query.startsWith(c);
+      });
+      const s = Number(season);
+      if (!Number.isNaN(s) && s > 0) {
+        target = cands.find((a) => extractSeasonNumber(a.animeTitle) === s);
+      }
+      target = target || cands[0];
+    }
+    if (!target) return null;
+
+    const freshId = target.bangumiId || target.animeId;
+    const detailRes = await Widget.http.get(
+      `${source.server}/api/v2/bangumi/${freshId}`,
+      { headers: getDanmuHeaders() }
+    );
+    const episodes = detailRes && detailRes.data && detailRes.data.bangumi && detailRes.data.bangumi.episodes;
+    return Array.isArray(episodes) && episodes.length > 0 ? episodes : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+// match 兜底：用 title+season+episode 构造标准文件名 → POST /match 直接匹配当前集。
+// 走库内直接匹配 + 触发"匹配后备"导入(需服务端开 matchFallbackEnabled)，命中稳定真实作品，不依赖会过期的临时ID。
+// 注意：parse_filename 要求 "标题 SxxExx" 格式（"第N集"格式匹配不到）。
+async function fetchEpisodesByMatch(source, title, season, episode) {
+  // 去来源后缀 + 去尾部"第N季/第N部"（季由 SxxExx 表达，避免 "剑来 第二季 S02E02" 季信息重复导致匹配失败）
+  const cleanTitle = cleanAnimeTitle(title).replace(/\s*第\s*[一二三四五六七八九十百零〇\d]+\s*[季部]\s*$/g, "").trim();
+  const e = Number(episode);
+  if (!cleanTitle || Number.isNaN(e) || e <= 0) return null;
+  const s = Number(season);
+  const seasonNum = !Number.isNaN(s) && s > 0 ? s : 1;
+  const fileName = `${cleanTitle} S${String(seasonNum).padStart(2, "0")}E${String(e).padStart(2, "0")}`;
+  try {
+    const response = await Widget.http.request({
+      url: `${source.server}/api/v2/match`,
+      method: "POST",
+      data: { fileName, fileHash: null, fileSize: 0, videoDuration: 0, matchMode: "fileNameOnly" },
+      headers: getDanmuHeaders(),
+    });
+    const data = response && response.data;
+    if (!data || !data.isMatched || !Array.isArray(data.matches) || data.matches.length === 0) return null;
+    const matched = data.matches[0];
+    // match 只返回匹配到的当前集，构造单集列表（episodeNumber 设为当前集，供 App 选集对齐）
+    return [{
+      episodeId: matched.episodeId,
+      episodeTitle: matched.episodeTitle || `第${e}集`,
+      episodeNumber: String(e),
+    }];
+  } catch (error) {
+    return null;
+  }
+}
+
+async function getDetailById(params) {
+  const { server, animeId, title, seriesName, season, episode } = params;
+  // match 用原始剧名(seriesName=video.seriesName)优先，而非 searchDanmu 选番后的候选名(title 被 App 覆盖成 provider.seriesName，可能偏到"特别版")
+  const matchTitle = seriesName || title;
+  const parsedAnimeId = parseDanmuServerId(animeId);
+  const sources = getDanmuRequestSources(server, parsedAnimeId.source);
+  const shouldBindSource = shouldShowDanmuSource(sources) || Boolean(parsedAnimeId.source);
+
+  // 多 source 并发，同 source 内 4 级 fallback 保持串行
+  const results = await mapDanmuSourcesInBatches(sources, DANMU_SOURCE_BATCH_SIZE, async (source) => {
+    try {
+      // 1. match 优先：用原始剧名(matchTitle)+season+episode 构造 "标题 SxxExx" 直接匹配当前集。
+      //    库内直接匹配 + 严格标题过滤，一步到位拿稳定 episodeId，不依赖易过期的临时ID。
+      let episodes = await fetchEpisodesByMatch(source, matchTitle, season, episode);
+      // 2. 失败 → 标准 bangumi 端点（官方 dandanplay / 真实作品ID 直接命中）
+      if (!episodes) {
+        episodes = await fetchEpisodesByBangumi(source, parsedAnimeId.id);
+      }
+      // 3. 失败 → 重新 search/anime 拿新鲜ID再 bangumi（并行后备实例走实时源）
+      if (!episodes) {
+        episodes = await fetchEpisodesByResearch(source, title, season);
+      }
+      // 4. 仍失败 → search/episodes 库内查询兜底（兼容未开后备/search-anime为空的实例如 wuqingfeng）
+      if (!episodes) {
+        episodes = await fetchEpisodesByLibrary(source, title, season);
+      }
+
+      if (episodes) {
+        return { source, episodes };
+      }
+      return { source, error: new Error("获取数据失败") };
+    } catch (error) {
+      console.error(`请求 ${source.server} 失败:`, error);
+      return { source, error };
+    }
+  });
+
+  let lastError = null;
+  let hasSuccessfulResponse = false;
+  const allEpisodes = [];
+
+  for (const result of results) {
+    if (result.error) {
+      lastError = result.error;
+      continue;
+    }
+    hasSuccessfulResponse = true;
+    allEpisodes.push(...result.episodes.map((episode) => ({
+      ...episode,
+      episodeId: bindDanmuServerId(episode.episodeId, result.source, shouldBindSource),
+      episodeTitle: appendDanmuSourceTitle(episode.episodeTitle, result.source, shouldBindSource),
+    })));
   }
 
-  return response.data.bangumi.episodes;
+  if (hasSuccessfulResponse) {
+    return allEpisodes;
+  }
+
+  throw lastError || new Error("获取数据失败");
 }
 
 async function getCommentsById(params) {
   const { server, commentId, link, videoUrl, season, episode, tmdbId, type, title } = params;
 
   if (commentId) {
-    // 调用弹弹play弹幕API - 使用Widget.http.get
-    const response = await Widget.http.get(
-      `${server}/api/v2/comment/${commentId}?withRelated=true&chConvert=1`,
-      {
-        headers: {
-          // "X-AppId": "",
-          // "X-AppSecret": "",
-          "Content-Type": "application/json",
-          "User-Agent": "ForwardWidgets/1.0.0",
-        },
-      }
-    );
+    const parsedCommentId = parseDanmuServerId(commentId);
+    const sources = getDanmuRequestSources(server, parsedCommentId.source);
+    let lastError = null;
 
-    if (!response) {
-      throw new Error("获取数据失败");
+    for (const source of sources) {
+      try {
+        // async=1：慢源/库外剧弹幕需实时下载，服务端会等待下载完成再返回（同步请求会直接返回0条）。
+        // widget JS 环境无 setTimeout，无法轮询 taskcomment；超长下载返回 taskId 时本次取不到，
+        // 靠 App "空弹幕不缓存→下次重试" + Misaka 预下载兜底。
+        const response = await Widget.http.get(
+          `${source.server}/api/v2/comment/${parsedCommentId.id}?async=1&withRelated=true&chConvert=1`,
+          {
+            headers: getDanmuHeaders(),
+          }
+        );
+
+        if (response) {
+          return response.data;
+        }
+
+        lastError = new Error("获取数据失败");
+      } catch (error) {
+        lastError = error;
+        console.error(`请求 ${source.server} 失败:`, error);
+      }
     }
-    return response.data;  
+
+    throw lastError || new Error("获取数据失败");
   }
   // else {
   //   // just for sample
