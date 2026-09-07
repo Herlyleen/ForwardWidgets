@@ -18,13 +18,13 @@
  *
  */
 WidgetMetadata = {
-  id: "forward.danmu",
-  title: "自定义弹幕",
-  version: "1.0.2",
+  id: "custom.logvar.danmu",
+  title: "LogVar弹幕",
+  version: "1.0.3",
   requiredVersion: "0.0.2",
-  description: "从指定服务器获取弹幕",
-  author: "Forward",
-  site: "https://github.com/InchStudio/ForwardWidgets",
+  description: "兼容 LogVar 电影分类并优先精确标题匹配",
+  author: "Herlyleen",
+  site: "https://github.com/Herlyleen/ForwardWidgets",
   globalParams: [
     {
       name: "server",
@@ -73,7 +73,7 @@ async function searchDanmu(params) {
 
   // 调用弹弹play搜索API - 使用Widget.http.get
   const response = await Widget.http.get(
-    `${server}/api/v2/search/anime?keyword=${queryTitle}`,
+    `${server}/api/v2/search/anime?keyword=${encodeURIComponent(queryTitle)}`,
     {
       headers: {
         // "X-AppId": "",
@@ -96,17 +96,36 @@ async function searchDanmu(params) {
   }
 
   // 开始过滤数据
-  const movieTypes = ["movie", "电影", "奇幻片", "剧场版"];
+  const isMovieAnime = (anime) => {
+    let animeType = String(anime.type || "").trim().toLowerCase();
+
+    // LogVar 等兼容接口可能使用“华语电影/外语电影/动画电影”，
+    // 或只在标题的【分类】中提供类型。
+    if (!animeType) {
+      animeType = String(anime.animeTitle || "")
+        .match(/【([^】]+)】/)?.[1]
+        ?.trim()
+        ?.toLowerCase() || "";
+    }
+
+    return (
+      animeType === "movie" ||
+      animeType.includes("电影") ||
+      animeType === "奇幻片" ||
+      animeType === "剧场版"
+    );
+  };
+
   let animes = [];
   if (data.animes && data.animes.length > 0) {
     animes = data.animes.filter((anime) => {
-      const animeType = (anime.type || "").toLowerCase();
+      const isMovie = isMovieAnime(anime);
       if (type === "movie") {
-        return movieTypes.some(t => t.toLowerCase() === animeType);
+        return isMovie;
       }
       // tv 类型兜底：只排除电影类型，其余都算剧集
       if (type === "tv") {
-        return !movieTypes.some(t => t.toLowerCase() === animeType);
+        return !isMovie;
       }
       return true;
     });
@@ -139,6 +158,28 @@ async function searchDanmu(params) {
       }
     }
   }
+  // 精确同名优先，避免“美人鱼村”等模糊结果排在“美人鱼”前面。
+  const normalizeSearchTitle = (value) =>
+    String(value || "")
+      .replace(/【[^】]*】/g, "")
+      .replace(/[（(]\d{4}[）)]/g, "")
+      .replace(/\s+from\s+.*$/i, "")
+      .replace(/\s+/g, "")
+      .toLowerCase();
+
+  const normalizedQuery = normalizeSearchTitle(queryTitle);
+  animes = animes
+    .map((anime, index) => {
+      const normalizedTitle = normalizeSearchTitle(anime.animeTitle);
+      let score = 0;
+      if (normalizedTitle === normalizedQuery) score = 3000;
+      else if (normalizedTitle.startsWith(normalizedQuery)) score = 1000;
+      else if (normalizedTitle.includes(normalizedQuery)) score = 100;
+      return { anime, score, index };
+    })
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map(({ anime }) => anime);
+
   return {
     animes: animes,
   };
